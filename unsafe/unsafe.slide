@@ -1,0 +1,365 @@
+Hacking Go with the Unsafe Package
+15 Mar 2017
+
+Luke Champine
+Nebulous
+
+http://lukechampine.com
+@lukechampine
+
+
+: Hi, I'm Luke, I'm one of the co-founders of Nebulous, a startup based here in Cambridge. We are using Go to build a decentralized cloud storage platform where people can use smart contracts on a blockchain to buy and sell storage for cryptocurrency.
+
+: Today I'm going to be talking about the unsafe package and how to use and abuse it. Because there are a lot of really neat things you can do with unsafe if you understand the nuances of the runtime. At the same time, you need to be aware of all the ways things can blow up in your face. And unsafe code is particularly insidious because it can introduce very subtle bugs that go undetected for a long time. So my job is to show you how to do to the cool stuff, but do it as safely as possible.
+
+
+
+* Package unsafe
+
+.background unsafe.png
+
+    Package unsafe contains operations that step around the type safety of Go programs.
+    
+    Packages that import unsafe may be non-portable and are not protected
+    by the Go 1.0 compatibility guidelines. 
+
+.html newlines.html
+
+`unsafe.Pointer` allows conversion between arbitrary types.
+
+But there are nuanced rules about how to do so safely.
+
+What is possible with `unsafe.Pointer`?
+
+: unsafe.Pointer is the building block for everything we're talking about today.
+: There are a few other functions in the unsafe package, but they aren't nearly
+: as interesting.
+
+
+* Encoding
+
+All program data is just bytes in memory.
+
+What happens if we cast arbitrary data to `[]byte`?
+
+Fastest possible encoder (with some tradeoffs).
+
+.play -edit few.go /START OMIT/,/END OMIT/
+
+
+
+* Immutability
+
+In Unix, we can call `mprotect` on mmap'd memory.
+
+Protected memory cannot be written to.
+
+What happens if we call `mprotect` on Go data?
+
+.play -edit freeze.go /START OMIT/,/END OMIT/
+
+
+
+* Random map access
+
+Go map iteration is not random!
+
+How can we make it truly random? Manipulate the runtime `map` object.
+
+.play -edit randmap.go /START OMIT/,/END OMIT/
+
+
+
+* The caveat
+
+All of these examples are unusable in production code.
+
+Why? Because they depend on memory layout & architecture.
+
+: Encoding is arch-specific
+: Immutability is Unix-only and causes unrecoverable panic
+: Random maps makes assumptions about hmap struct
+
+In practice, `unsafe` is only prod-safe in a very limited scope.
+
+    // from math/unsafe.go
+    func Float64bits(f float64) uint64 {
+        return *(*uint64)(unsafe.Pointer(&f))
+    }
+ 
+    // from crypto/md5/md5block.go
+    func blockGeneric(dig *digest, p []byte) {
+        for len(p) >= chunk {
+            // MD5 was designed so that x86 processors can just iterate
+            // over the block data directly as uint32s
+            X := (*[16]uint32)(unsafe.Pointer(&p[0]))
+
+            // Round 1
+            // ...
+
+
+
+* Rules for unsafe.Pointer
+
+1. You can convert between `unsafe.Pointer` and any pointer type:
+
+    b := [4]byte{1, 2, 3, 4}
+    x := *(*int32)(unsafe.Pointer(&b))
+
+
+2. You can convert between `unsafe.Pointer` and `uintptr` (e.g. to do pointer math):
+
+    // ok
+    p = unsafe.Pointer(uintptr(p) + 8)
+
+But such conversions should be a single expression with no intermediate steps:
+
+    // not ok!
+    u := uintptr(p)
+    p = unsafe.Pointer(u+8)
+
+
+This is because a `uintptr` *is*not*a*reference!*
+It will not be tracked by the garbage collector. That means the underlying memory may be reclaimed or moved without warning.
+
+: unsafe.Pointer does not have integer semantics
+: syscall.Syscall: must convert to uintptr in arg list
+
+
+
+* Example of safe unsafe.Pointer conversion
+
+From `runtime/hashmap.go`
+
+    // A bucket for a Go map.
+    type bmap struct {
+        tophash [8]uint8
+        // Followed by 8 keys and then 8 values -- size depends on map type.
+        // Followed by an overflow pointer.
+    }
+
+    // overflow returns the next bucket in the overflow chain
+    func (b *bmap) overflow(t *maptype) *bmap {
+        offset := t.bucketsize - unsafe.Sizeof(b))
+        return *(**bmap)(unsafe.Pointer(uintptr(unsafe.Pointer(b)) + offset))
+    }
+
+To help visualize this, the memory layout for a `map[int]string` bucket is:
+
+    type intstring_bmap struct {
+        tophash  [8]uint8
+        keys     [8]int
+        values   [8]string
+        overflow *intstring_bmap
+    }
+
+
+
+* Rules for reflect.StringHeader and reflect.SliceHeader
+
+Package `reflect` contains types that define the in-memory representation of the `string` and slice types:
+
+    type StringHeader struct {
+        Data uintptr
+        Len  int
+    }
+ 
+    type SliceHeader struct {
+        Data uintptr
+        Len  int
+        Cap  int
+    }
+
+`Data` is a `uintptr` so that callers must import `unsafe` in order to use `Data` as a pointer.
+
+As a result, when you cast an existing `[]byte` to `reflect.SliceHeader`, the actual pointer is tracked by GC, but `Data` is not. Storing a different value in `Data` doesn't cause GC to start tracking it.
+This is why the docs tell you not to allocate new variables of these types.
+
+: Would GC work if we declared our own type with unsafe.Pointer instead of uintptr?
+:    (answer: yes)
+: These are the _only_ types whose memory layout is guaranteed by the language! (Well, interface{} too)
+: (Even then, they are not guaranteed to be stable or portable.)
+
+
+
+* Example usage of reflect.StringHeader and reflect.SliceHeader
+
+Conversions between `[]byte` and `string` are expensive.
+We can do better if we know something the compiler doesn't.
+
+    func (h *myhash) WriteString(s string) (int, error) {
+        sh := (*reflect.StringHeader)(unsafe.Pointer(&s))
+        return h.Write(*(*[]byte)(unsafe.Pointer(&reflect.SliceHeader{
+            Data: sh.Data,
+            Len:  sh.Len,
+            Cap:  sh.Len,
+        })))
+    }
+
+: Question: are we allocating a reflect.SliceHeader here, or a []byte?
+: from the runtime's perspective, seems to be a []byte
+
+But don't go thinking you're smarter than the compiler! Many conversions are already optimized away:
+
+- `m[string(b)]` where `m` is a `map[string]T`
+- `string(b)`==`"foo"`
+- `string(b)`+`"bar"`
+
+
+
+* Pop quiz: is this safe?
+
+    b := []byte("foo")
+    s := *(*string)(unsafe.Pointer(&b))
+
+What happens if `b` is modified?
+
+What happens if `b` is resized?
+
+What happens if `b` is garbage collected?
+
+: if b is modified, s is also modified
+: if b is resized, s is unchanged
+: b will not be garbage collected until s is also unreachable
+
+
+
+* Encoding (revisited)
+
+We can now create the world's fastest Go encoder!
+
+    const writeTempl = `
+        _, err = w.Write(*(*[]byte)(unsafe.Pointer(
+            &reflect.SliceHeader{Data: %[1]s, Len: %[2]s, Cap: %[2]s}
+        )))
+        if err != nil {
+            return
+        }
+    `
+
+    func (g *generator) generateBasic(name string) {
+        ptr := fmt.Sprintf("uintptr(unsafe.Pointer(&%s))", name)
+        size := fmt.Sprintf("int(unsafe.Sizeof(%s))", name)
+        g.Printf(writeTempl, ptr, size)
+    }
+
+    func (g *generator) generateSlice(name string) {
+        g.Printf("sli = (*reflect.SliceHeader)(unsafe.Pointer(&%s))", name)
+        g.generateBasic("sli.Len")
+        sliceSize := fmt.Sprintf("sli.Len * int(unsafe.Sizeof(%s[0]))", name)
+        g.Printf(writeTempl, "sli.Data", slizeSize)
+    }
+
+
+
+* Encoding (cont.)
+
+Example output:
+
+    func WriteString(w io.Writer, s string) error {
+        str := (*reflect.StringHeader)(unsafe.Pointer(&s))
+        _, err := w.Write(*(*[]byte)(unsafe.Pointer(
+            &reflect.SliceHeader{
+                Data: uintptr(unsafe.Pointer(&str.Len)),
+                Len: int(unsafe.Sizeof(str.Len)),
+                Cap: int(unsafe.Sizeof(str.Len)),
+            })))
+        if err != nil {
+            return err
+        }
+        if str.Len != 0 {
+            _, err = w.Write(*(*[]byte)(unsafe.Pointer(
+                &reflect.SliceHeader{Data: str.Data, Len: str.Len, Cap: str.Len}
+            )))
+            if err != nil {
+                return err
+            }
+        }
+        return nil
+    }
+
+
+
+* Immutability (revisited)
+
+Let's see how `freeze` works internally.
+
+.code freeze.go /STARTIMPL OMIT/,/ENDIMPL OMIT/
+
+Need to set a runtime finalizer:
+
+    runtime.SetFinalizer(&frozen, func(b *[]byte) { _ = unix.Munmap(*b) })
+
+: &frozen[0] is a trick, shorthand for accessing Data field
+
+
+
+* Converting any object to []byte
+
+First, we need to understand the internal representation of `interface{}`
+
+    type emptyInterface struct {
+        typ unsafe.Pointer // points to type information
+        val unsafe.Pointer // points to underlying value
+    }
+
+The structure of `typ` varies, but the first element is always the size of the object. Since we know the size and have a pointer to the underlying data, we can construct a slice:
+
+    func toBytes(v interface{}) []byte {
+        ei := (*emptyInterface)(unsafe.Pointer(&v))
+        size := *(*uintptr)(ei.typ)
+        return *(*[]byte)(unsafe.Pointer(&reflect.SliceHeader{
+            Data: uintptr(ei.val),
+            Len:  int(size),
+            Cap:  int(size),
+        })))
+    }
+
+For more details, read [[https://research.swtch.com/interfaces]]
+
+: Safer would be reflect.TypeOf(v).Size()
+
+
+
+* Random map access (revisited)
+
+Approach: create a `map` iterator and advance it a random number of times.
+
+This is equivalent to the following, but generic:
+
+    func randMapKey(m map[int]string) int {
+        r := rand.Intn(len(m))
+        for k := range m {
+            if r == 0 {
+                return k
+            }
+            r--
+        }
+        panic("unreachable")
+    }
+
+The `map` iterator object and its associated functions are internal to the `runtime` package, but we can copy the necessary code and use `unsafe.Pointer` to convert as necessary.
+
+
+
+* Random map access (cont.)
+
+.code randmap.go /STARTIMPL OMIT/,/ENDIMPL OMIT/
+
+
+
+* Precautions
+
+Messing with `map` is more dangerous because its layout is not very stable.
+
+We can safeguard this somewhat via build tags:
+
+    // +build go1.7
+
+But this only works for old versions; new "point" releases may change the layout.
+
+Furthermore, `map` layout depends on the compiler! (People often forget about `gccgo`.)
+
+If you are publishing `unsafe` code, you *must* make that very clear in the documentation. 
+
+Don't expose `unsafe.Pointer` in your API (return values, struct fields). Force the caller to `import`"unsafe"`.
